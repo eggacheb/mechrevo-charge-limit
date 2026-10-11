@@ -19,6 +19,7 @@
   * 若发现 0x07C3 停在 4/5（上次异常残留），按已知出厂原值 0x07 修复
 """
 import ctypes
+import json
 import os
 import struct
 import subprocess
@@ -101,94 +102,168 @@ def power_status():
 
 
 def platform_original(h):
-    """返回应当恢复的平台值，以及是否为残留修复。"""
+    """返回应当恢复的平台值，以及当前是否处于钉扎状态。
+
+    钉扎状态下 0x07C3 本身就是 0x04，此时要恢复到出厂原值。
+    """
     cur = ec_read(h, REG_PLATFORM)
     if cur in (STORE_MAGIC, 5):
-        return PLATFORM_DEFAULT, True     # 上次异常残留，按出厂原值修复
+        return PLATFORM_DEFAULT, True
     return cur, False
 
 
-def store_trigger(h):
-    """让门控条件短暂成立，触发固件 store_limit()，随后恢复平台原值。
+# ---------- 配置：供开机守护 (pin_guard.py) 读取 ----------
+CFG_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "MechrevoChargeLimit")
+CFG_PATH = os.path.join(CFG_DIR, "setting.json")
+HEARTBEAT_PATH = os.path.join(CFG_DIR, "guard_heartbeat.json")
 
-    返回 (成功?, 说明)。成功后 0x07C3 一定等于原值。
 
-    每一步都做回读校验：
-      写入 0x04 后必须读到 0x04（否则门控没开，固件不会 store_limit()，
-      此时若照旧报"成功"，取消限充就会出现 live 清零而 stored 未清的错配）
-    """
-    original, was_stale = platform_original(h)
-    last = "未知原因"
+def write_setting(enabled, limit, original_value):
     try:
-        for _ in range(3):
-            # 1) 开门控前，先确保当前值就是准备恢复的原值
-            if ec_read(h, REG_PLATFORM) != original:
-                ec_write(h, REG_PLATFORM, original)
-                time.sleep(0.2)
+        os.makedirs(CFG_DIR, exist_ok=True)
+        data = {
+            "enabled": bool(enabled),
+            "limit": int(limit),
+            "platform_original": int(original_value),
+        }
+        tmp = CFG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, CFG_PATH)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
 
-            # 2) 开门控，并确认真的写进去了
-            ec_write(h, REG_PLATFORM, STORE_MAGIC)
-            time.sleep(0.25)
-            if ec_read(h, REG_PLATFORM) != STORE_MAGIC:
-                last = "平台寄存器写入未生效"
-                continue
 
-            # 3) 保持，让固件控制循环执行 store_limit()
-            time.sleep(STORE_HOLD_SEC - 0.25)
+def guard_status():
+    """返回 (守护是否在运行, 上次心跳距今秒数, 心跳内容)。"""
+    try:
+        with open(HEARTBEAT_PATH, "r", encoding="utf-8") as f:
+            hb = json.load(f)
+        age = time.time() - float(hb.get("time", 0))
+        alive = age < max(90.0, float(hb.get("interval", 30)) * 3)
+        return alive, age, hb
+    except Exception:
+        return False, None, {}
 
-            # 4) 恢复原值并确认
-            ec_write(h, REG_PLATFORM, original)
-            time.sleep(0.4)
-            if ec_read(h, REG_PLATFORM) == original:
-                note = "（并修复了上次残留的平台值）" if was_stale else ""
-                return True, "存储触发完成，平台寄存器已恢复 %#04x%s" % (original, note)
-            last = "平台寄存器恢复未确认"
-    finally:
-        # 兜底：无论成功、失败还是抛异常，都不允许平台值停在 4/5
+
+def _pythonw_exe():
+    exe = sys.executable
+    cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(cand):
+        return cand
+    return exe
+
+
+def guard_script_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "pin_guard.py"),
+                 os.path.join(here, "tools", "pin_guard.py")):
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(here, "pin_guard.py")
+
+
+def start_guard():
+    """以后台方式拉起守护进程。返回 (成功?, 错误)。"""
+    script = guard_script_path()
+    if not os.path.exists(script):
+        return False, "未找到 pin_guard.py（应与本程序在同一目录）"
+    try:
+        subprocess.Popen(
+            [_pythonw_exe(), script], cwd=os.path.dirname(script),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=0x00000008 | 0x08000000,   # DETACHED_PROCESS | CREATE_NO_WINDOW
+        )
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def stop_guard():
+    """按心跳里的 PID 结束守护，并清掉心跳文件。返回 (成功?, 错误)。"""
+    _, _, hb = guard_status()
+    pid = hb.get("pid") if hb else None
+    if not pid:
+        return False, "心跳里没有 PID 记录"
+    try:
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True, timeout=10, creationflags=0x08000000)
+        # 清掉心跳，让界面立刻反映“未运行”（否则要等 90 秒心跳过期）
         try:
-            if ec_read(h, REG_PLATFORM) in (STORE_MAGIC, 5):
-                ec_write(h, REG_PLATFORM, original)
-                time.sleep(0.2)
+            os.remove(HEARTBEAT_PATH)
         except OSError:
             pass
-
-    try:
-        now = ec_read(h, REG_PLATFORM)
-    except OSError:
-        now = -1
-    return False, ("平台寄存器 0x07C3 三次操作失败（%s），当前 %#04x —— 请手动检查！"
-                   % (last, now))
+        if r.returncode != 0:
+            return False, "taskkill 返回 %d" % r.returncode
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
 
 
 def apply_limit(limit):
-    """设置上限（100 表示取消限充）。返回 (成功?, 说明)。"""
+    """设置 / 取消充电上限。返回 (成功?, 说明)。
+
+    本机型要点：门控 0x07C3 必须**常驻 0x04**，限充才会工作 ——
+    固件不会用存储值 0x087F 维持门控（这点与上游实测的无界15X 不同）。
+    钉扎值在普通 EC RAM 里，重启即丢，由开机守护重放。
+
+    取消时反向操作：先清 0x07B9，再让门控短暂开一下把存储值也清成 0，
+    最后把 0x07C3 释放回出厂原值。
+    """
     h = open_driver()
     if h is None:
         return False, "无法打开 EC 通道（未找到 UWACPIDriver 设备）"
     try:
         target = 0x00 if limit >= 100 else (limit & 0x7F)
+        original, _ = platform_original(h)
+
+        # 1) 先写实时上限并回读
         ec_write(h, REG_LIMIT, target)
         time.sleep(0.2)
         live = ec_read(h, REG_LIMIT) & 0x7F
         if live != target:
             return False, "实时上限回读为 %d%%，与目标 %d%% 不符，已中止" % (live, target)
 
-        ok, msg = store_trigger(h)
-        if not ok:
-            return False, msg
+        # 2) 开门控：设置时钉住不放，取消时用完即还
+        ec_write(h, REG_PLATFORM, STORE_MAGIC)
+        time.sleep(0.25)
+        if ec_read(h, REG_PLATFORM) != STORE_MAGIC:
+            try:
+                ec_write(h, REG_PLATFORM, original)
+            except OSError:
+                pass
+            return False, "门控寄存器写入未生效，已回滚"
 
-        time.sleep(1.0)
-        live = ec_read(h, REG_LIMIT) & 0x7F
-        if live != target:
-            return False, "存储触发后上限变为 %d%%，未达到 %d%%" % (live, target)
+        time.sleep(STORE_HOLD_SEC - 0.25)   # 顺带让固件把存储值也更新一遍
 
         if limit >= 100:
-            return True, "已取消限充，电池恢复充满（固件存储值已清零）"
-        return True, "已设为 %d%%，并写入固件存储区（重启/关机都不失效）" % limit
+            ec_write(h, REG_PLATFORM, original)
+            time.sleep(0.6)
+            now = ec_read(h, REG_PLATFORM)
+            if now != original:
+                return False, "平台值恢复失败，当前 %#04x —— 请手动检查！" % now
+            if ((ec_read(h, REG_GATE) >> 2) & 1) != 0:
+                return False, "上限已清，但门控未回落，请再点一次"
+            return True, "已取消限充，门控已释放，电池恢复充满"
+
+        # 3) 校验钉扎确实生效
+        live = ec_read(h, REG_LIMIT) & 0x7F
+        gate = (ec_read(h, REG_GATE) >> 2) & 1
+        romid = ec_read(h, REG_ROMID)
+        if live != target:
+            return False, "钉扎后上限变为 %d%%，未达到 %d%%" % (live, target)
+        if gate != 1:
+            return False, "门控未置位，限充不会生效，请重试一次"
+        if romid == STORE_MAGIC:
+            return False, "身份字节 0x0770 被改动（%#04x），请立即恢复！" % romid
+        return True, "已设为 %d%%，门控已钉扎（重启后由守护自动重放）" % limit
     except OSError as exc:
         return False, "EC 操作失败：%s" % exc
     finally:
         kernel32.CloseHandle(h)
+
 
 
 def is_admin():
@@ -319,7 +394,7 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self.resizable(False, False)
         w = min(880, int(self.winfo_screenwidth() * 0.9))
-        h = 665
+        h = 700
         x = (self.winfo_screenwidth() - w) // 2
         y = (self.winfo_screenheight() - h) // 3
         self.geometry("%dx%d+%d+%d" % (w, h, x, y))
@@ -349,6 +424,16 @@ class App(tk.Tk):
             tk.Button(perm, text="以管理员身份重启", font=(FONT, 9), relief="flat", bd=0,
                       cursor="hand2", bg="#e8e8ea", fg=FG, activebackground="#d8d8da",
                       command=self.on_elevate).pack(side="right", ipady=2, padx=(8, 0))
+
+        guard_row = tk.Frame(wrap, bg=BG)
+        guard_row.pack(fill="x", pady=(0, 10))
+        self.guard_lbl = tk.Label(guard_row, text="", bg=BG, fg=MUTED,
+                                  font=(FONT, 9), anchor="w")
+        self.guard_lbl.pack(side="left")
+        self.guard_btn = tk.Button(guard_row, text="启动守护", font=(FONT, 9), relief="flat",
+                                   bd=0, cursor="hand2", bg="#e8e8ea", fg=FG,
+                                   activebackground="#d8d8da", command=self.on_guard_toggle)
+        self.guard_btn.pack(side="right", ipady=2)
 
         top = tk.Frame(wrap, bg=CARD, highlightbackground=BORDER,
                        highlightthickness=1, padx=20, pady=14)
@@ -417,6 +502,14 @@ class App(tk.Tk):
             self.update_idletasks()
             ok, msg = apply_limit(limit)
 
+            if ok:
+                # 写配置，供开机守护重放（这张“意图”必须留下来）
+                saved, err = write_setting(limit < 100,
+                                           0 if limit >= 100 else limit,
+                                           PLATFORM_DEFAULT)
+                if not saved:
+                    msg += " · 配置写入失败（%s），重启后需手动重应用" % err
+
             if ok and self.admin:
                 self.verdict.config(text="正在经固件邮箱复核存储区…", fg=MUTED)
                 self.update_idletasks()
@@ -468,7 +561,35 @@ class App(tk.Tk):
             self._busy = False
             self.refresh()
 
+    def on_guard_toggle(self):
+        if self._busy:
+            return
+        self._busy = True
+        alive, _, _ = guard_status()
+        if alive:
+            ok, err = stop_guard()
+            msg = "守护已停止" if ok else ("停止失败：%s" % err)
+        else:
+            ok, err = start_guard()
+            msg = "守护已启动（后台运行）" if ok else ("启动失败：%s" % err)
+        self._flash = (msg, OK if ok else BAD)
+        self._busy = False
+        self.verdict.config(text=("✔ " if ok else "⚠ ") + msg, fg=OK if ok else BAD)
+        self.detail.config(text="守护在后台每 30 秒自检一次；开机时由启动项自动拉起。")
+        self.after(1500, self.refresh)
+
     def refresh(self):
+        alive, age, hb = guard_status()
+        self.guard_btn.config(text="停止守护" if alive else "启动守护")
+        if alive:
+            self.guard_lbl.config(
+                text="限充守护：运行中 · 目标 %s%% · 心跳 %s（重启后自动重放）"
+                     % (hb.get("limit", "?"), hb.get("time_str", "?")), fg=OK)
+        else:
+            age_txt = "" if age is None else "（心跳 %.0f 秒前）" % age
+            self.guard_lbl.config(
+                text="限充守护：未运行%s —— 重启后钉扎会丢，点右侧按钮启动" % age_txt, fg=WARN)
+
         st = read_state()
         if st["error"]:
             self.verdict.config(text="⚠ 读取失败", fg=BAD)
@@ -511,7 +632,7 @@ class App(tk.Tk):
             self.verdict.config(text=("✔ " if color == OK else "⚠ ") + flash, fg=color)
             if color == OK:
                 self.detail.config(
-                    text="该值已写入固件存储区，重启、关机、拔电源都不会失效，也不需要任何后台程序。")
+                    text="门控已钉扎、限充正在工作。钉扎值重启会丢，由开机守护自动重放（见上方守护状态）。")
             elif color == WARN:
                 self.detail.config(
                     text="存储值不在 1–100 范围内，门控不会常开，电池会正常充满。")

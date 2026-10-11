@@ -111,65 +111,86 @@ def write_heartbeat(payload):
         pass
 
 
+def _tick(last_state, last_err):
+    """执行一轮自检。返回 (新的 last_state, 新的 last_err)。"""
+    cfg = read_cfg()
+    enabled = bool(cfg.get("enabled"))
+    try:
+        limit = int(cfg.get("limit", 80))
+    except Exception:
+        limit = 80
+    try:
+        original = int(cfg.get("platform_original", PLATFORM_DEFAULT))
+    except Exception:
+        original = PLATFORM_DEFAULT
+    if limit < 1 or limit > 100:
+        limit = 80
+    if original in (PIN_VALUE, 5):
+        original = PLATFORM_DEFAULT
+
+    h = open_driver()
+    action = "no-channel" if h is None else ""
+    try:
+        if h is not None:
+            if enabled:
+                fixed = []
+                cur_lim = rd(h, REG_LIMIT)
+                if cur_lim is None or (cur_lim & 0x7F) != limit:
+                    wr(h, REG_LIMIT, limit & 0x7F)
+                    fixed.append("limit=%d" % limit)
+                if rd(h, REG_PLATFORM) != PIN_VALUE:
+                    wr(h, REG_PLATFORM, PIN_VALUE)
+                    fixed.append("gate=0x%02X" % PIN_VALUE)
+                action = "ensure:" + (",".join(fixed) if fixed else "ok")
+            else:
+                if rd(h, REG_PLATFORM) != original:
+                    wr(h, REG_PLATFORM, original)
+                    action = "release:gate=0x%02X" % original
+                else:
+                    action = "idle(disabled)"
+    except Exception as exc:
+        action = "error:%s" % exc
+    finally:
+        if h is not None:
+            kernel32.CloseHandle(h)
+
+    state = (enabled, limit, action)
+    if state != last_state:
+        log("enabled=%s limit=%s -> %s" % (enabled, limit, action))
+        last_state = state
+    if action.startswith("error"):
+        if action != last_err:
+            log("EC 操作异常：%s" % action)
+            last_err = action
+    else:
+        last_err = None
+
+    write_heartbeat({
+        "pid": os.getpid(),
+        "time": time.time(),
+        "time_str": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "enabled": enabled,
+        "limit": limit,
+        "action": action,
+        "interval": INTERVAL,
+    })
+    return last_state, last_err
+
+
 def main():
     log("guard started (interval=%ss, pid=%s)" % (INTERVAL, os.getpid()))
     last_state = None
+    last_err = None
+
     while True:
-        cfg = read_cfg()
-        enabled = bool(cfg.get("enabled"))
+        # 整个循环体都包在 try 里：任何意外（驱动报错、编码问题、
+        # 文件被占用…）都不允许把守护悄悄带走。它必须一直活着。
         try:
-            limit = int(cfg.get("limit", 80))
-        except Exception:
-            limit = 80
-        try:
-            original = int(cfg.get("platform_original", PLATFORM_DEFAULT))
-        except Exception:
-            original = PLATFORM_DEFAULT
-        if limit < 1 or limit > 100:
-            limit = 80
-        if original in (PIN_VALUE, 5):
-            original = PLATFORM_DEFAULT
-
-        h = open_driver()
-        action = "no-channel" if h is None else ""
-        try:
-            if h is not None:
-                if enabled:
-                    fixed = []
-                    cur_lim = rd(h, REG_LIMIT)
-                    if cur_lim is None or (cur_lim & 0x7F) != limit:
-                        wr(h, REG_LIMIT, limit & 0x7F)
-                        fixed.append("limit=%d" % limit)
-                    if rd(h, REG_PLATFORM) != PIN_VALUE:
-                        wr(h, REG_PLATFORM, PIN_VALUE)
-                        fixed.append("gate=0x%02X" % PIN_VALUE)
-                    action = "ensure:" + (",".join(fixed) if fixed else "ok")
-                else:
-                    if rd(h, REG_PLATFORM) != original:
-                        wr(h, REG_PLATFORM, original)
-                        action = "release:gate=0x%02X" % original
-                    else:
-                        action = "idle(disabled)"
-        except Exception as exc:
-            action = "error:%s" % exc
-        finally:
-            if h is not None:
-                kernel32.CloseHandle(h)
-
-        state = (enabled, limit, action)
-        if state != last_state:
-            log("enabled=%s limit=%s -> %s" % (enabled, limit, action))
-            last_state = state
-
-        write_heartbeat({
-            "pid": os.getpid(),
-            "time": time.time(),
-            "time_str": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "enabled": enabled,
-            "limit": limit,
-            "action": action,
-            "interval": INTERVAL,
-        })
+            last_state, last_err = _tick(last_state, last_err)
+        except BaseException as exc:
+            if repr(exc) != last_err:
+                log("loop error: %r" % (exc,))
+                last_err = repr(exc)
         time.sleep(INTERVAL)
 
 

@@ -2,20 +2,28 @@
 """电池充电上限 — 机械革命 蛟龙16QS (GM6XG0Q) 适配版
 
 原理（同方/Uniwill EC）：
-  1) 写 0x07B9 = <上限%>                     设置实时上限
-  2) 临时写 0x07C3 = 0x04，保持 2.5 秒再恢复原值
-     —— 让固件门控条件短暂成立，固件会把实时上限抄进存储区 0x087F
-  3) 之后由存储值自行维持，重启/关机/拔电源都不丢，无需后台程序
-  取消：上限写 0，再走一次同样的存储触发。
+  1) 写 0x07B9 = <上限%>              设置实时上限
+  2) 把门控寄存器 0x07C3 常置为 0x04   —— 控制环路才会真正接管充电
+  3) 存储区 0x087F 会一并写入目标值，但**本机型固件不采信存储值维持门控**，
+     所以 0x07C3 必须一直保持在 0x04。
+  取消：0x07B9 写 0，并把 0x07C3 恢复到出厂原值 0x07（释放门控）。
 
-本机型差异（与项目实测的无界15X 不同）：
-  * 0x0742 bit2 只反映 0x07C3 / 0x0770 是否等于 4/5，
-    不反映"存储维持"这条路径 —— 因此本工具不拿它当成功判据。
-  * 成功判据 = 实时上限回读 == 目标值，且平台寄存器 0x07C3 已确认恢复原值。
+本机型与上游实测机型（无界15X）的关键差异：
+  * 无界15X：存储触发一次写入即可永久生效，固件自行维持门控。
+  * 蛟龙16QS：存储值**能跨重启保持**（实测 0x087F 重启后仍为 80），
+    但固件**不会**用它维持门控 —— 实测电池会一路冲过 80% 直到 100%。
+    唯一有效做法是让 0x07C3 保持 0x04（"钉扎"）。
+  * 0x07C3 位于普通 EC RAM，**重启即丢**，因此必须由开机守护重放
+    （见 pin_guard.py）。这也就是"钉扎易失"这个代价的来源。
+
+正确性判据：
+  * 0x0742 bit2 = 1 才是"控制环路已激活"的可靠信号（钉扎成功后 5 秒内变 1，
+    同时电池电流归零）。存储写入成功**不代表**限充生效。
+  * 成功判据 = 实时上限回读 == 目标值 + 平台寄存器 0x07C3 已确认写入 0x04。
 
 安全约束：
   * 绝不写 0x0770（ROM ID 身份字节）
-  * 平台寄存器 0x07C3 必须恢复原值；失败会重试，仍失败则明确报警
+  * 平台寄存器 0x07C3 的写入会做回读校验；异常路径有兜底恢复
   * 若发现 0x07C3 停在 4/5（上次异常残留），按已知出厂原值 0x07 修复
 """
 import ctypes
@@ -51,6 +59,11 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.CreateFileW.restype = ctypes.c_void_p
 kernel32.DeviceIoControl.restype = ctypes.c_bool
 kernel32.CloseHandle.restype = ctypes.c_bool
+# HANDLE 是 64 位，必须显式声明，否则默认 c_int 会截断句柄
+kernel32.OpenProcess.restype = ctypes.c_void_p
+kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_uint32]
+kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
 
 
 class SYSTEM_POWER_STATUS(ctypes.Structure):
@@ -120,6 +133,16 @@ CFG_PATH = os.path.join(CFG_DIR, "setting.json")
 HEARTBEAT_PATH = os.path.join(CFG_DIR, "guard_heartbeat.json")
 
 
+def read_setting():
+    """读取守护配置。返回 dict（读不到时返回空 dict）。"""
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def write_setting(enabled, limit, original_value):
     try:
         os.makedirs(CFG_DIR, exist_ok=True)
@@ -137,16 +160,50 @@ def write_setting(enabled, limit, original_value):
         return False, str(exc)
 
 
+def _pid_alive(pid):
+    """判断 PID 是否还在运行。
+
+    返回 True(在跑) / False(已退出) / None(权限不足，无法判定)。
+    """
+    if not pid:
+        return False
+    try:
+        SYNCHRONIZE = 0x00100000
+        h = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        if not h:
+            # 5 = ERROR_ACCESS_DENIED：对方权限更高（例如守护是提权跑的），
+            # 无权判定存活，返回 None 交给心跳时间戳兜底，避免误报“未运行”。
+            return None if ctypes.get_last_error() == 5 else False
+        rc = kernel32.WaitForSingleObject(h, 0)
+        kernel32.CloseHandle(h)
+        return rc == 0x00000102          # WAIT_TIMEOUT => 仍在运行
+    except Exception:
+        return None
+
+
 def guard_status():
-    """返回 (守护是否在运行, 上次心跳距今秒数, 心跳内容)。"""
+    """返回 (守护是否在运行, 上次心跳距今秒数, 心跳内容)。
+
+    只看心跳时间戳会**误报**：守护被外部结束后心跳文件仍留在磁盘上，
+    在 90 秒新鲜期内界面照样显示“运行中”。所以这里同时校验 PID 是否真的存活。
+    """
     try:
         with open(HEARTBEAT_PATH, "r", encoding="utf-8") as f:
             hb = json.load(f)
-        age = time.time() - float(hb.get("time", 0))
-        alive = age < max(90.0, float(hb.get("interval", 30)) * 3)
-        return alive, age, hb
     except Exception:
         return False, None, {}
+    try:
+        age = time.time() - float(hb.get("time", 0) or 0)
+    except Exception:
+        age = 1e9
+    try:
+        interval = float(hb.get("interval", 30) or 30)
+    except Exception:
+        interval = 30.0
+    fresh = age < max(90.0, interval * 3)
+    pid_ok = _pid_alive(hb.get("pid"))
+    alive = (pid_ok is not False) and fresh
+    return alive, age, hb
 
 
 def _pythonw_exe():
@@ -166,41 +223,61 @@ def guard_script_path():
     return os.path.join(here, "pin_guard.py")
 
 
+DETACHED_PROCESS = 0x00000008
+CREATE_NO_WINDOW = 0x08000000
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
 def start_guard():
-    """以后台方式拉起守护进程。返回 (成功?, 错误)。"""
+    """以后台方式拉起守护进程。返回 (成功?, 错误)。
+
+    用 DETACHED_PROCESS 脱离控制台；并优先加 CREATE_BREAKAWAY_FROM_JOB
+    脱离调用方所在的 Job 对象 —— 否则 GUI 一退出（点「以管理员身份重启」、
+    从托盘退出、或被父进程清理），守护会被 Job 连带杀掉。Job 不允许脱离时
+    自动降级为不带该标志启动。
+    """
     script = guard_script_path()
     if not os.path.exists(script):
         return False, "未找到 pin_guard.py（应与本程序在同一目录）"
-    try:
-        subprocess.Popen(
-            [_pythonw_exe(), script], cwd=os.path.dirname(script),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=0x00000008 | 0x08000000,   # DETACHED_PROCESS | CREATE_NO_WINDOW
-        )
-        return True, None
-    except Exception as exc:
-        return False, str(exc)
+    base = DETACHED_PROCESS | CREATE_NO_WINDOW
+    last = None
+    for extra in (CREATE_BREAKAWAY_FROM_JOB, 0):
+        try:
+            subprocess.Popen(
+                [_pythonw_exe(), script], cwd=os.path.dirname(script),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=base | extra,
+            )
+            return True, None
+        except OSError as exc:
+            last = exc
+    return False, str(last)
 
 
 def stop_guard():
-    """按心跳里的 PID 结束守护，并清掉心跳文件。返回 (成功?, 错误)。"""
+    """结束守护并清掉心跳文件。返回 (成功?, 错误)。
+
+    守护可能已经被外部结束（心跳是陈旧的）：这种情况不算失败，直接清掉
+    心跳即可，避免界面弹出莫名其妙的“停止失败”。
+    """
     _, _, hb = guard_status()
     pid = hb.get("pid") if hb else None
-    if not pid:
-        return False, "心跳里没有 PID 记录"
-    try:
-        r = subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                           capture_output=True, timeout=10, creationflags=0x08000000)
-        # 清掉心跳，让界面立刻反映“未运行”（否则要等 90 秒心跳过期）
+    if pid and _pid_alive(pid) is not False:
         try:
-            os.remove(HEARTBEAT_PATH)
-        except OSError:
-            pass
-        if r.returncode != 0:
-            return False, "taskkill 返回 %d" % r.returncode
-        return True, None
-    except Exception as exc:
-        return False, str(exc)
+            r = subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                               capture_output=True, timeout=10,
+                               creationflags=CREATE_NO_WINDOW)
+            if r.returncode != 0:
+                # 进程恰好在此期间退出也会返回非零，只要已不在就算成功
+                if _pid_alive(pid) is not False:
+                    return False, "taskkill 返回 %d" % r.returncode
+        except Exception as exc:
+            return False, str(exc)
+    try:
+        os.remove(HEARTBEAT_PATH)
+    except OSError:
+        pass
+    return True, None
 
 
 # ---------- 系统托盘 ----------
@@ -462,6 +539,7 @@ class App(tk.Tk):
         self._build()
         self.after(150, self.refresh)
         self.after(400, self._start_tray)
+        self.after(900, self._ensure_guard_once)
 
     def _build(self):
         wrap = tk.Frame(self, bg=BG, padx=28, pady=16)
@@ -469,7 +547,7 @@ class App(tk.Tk):
 
         tk.Label(wrap, text="电池充电上限", bg=BG, fg=FG,
                  font=(FONT, 17, "bold")).pack(anchor="w")
-        tk.Label(wrap, text="机械革命 蛟龙16QS (GM6XG0Q) · 直接写入 EC 固件，跨重启保持",
+        tk.Label(wrap, text="机械革命 蛟龙16QS (GM6XG0Q) · 本机型固件不采信存储值，需守护常驻钉扎（重启后自动重放）",
                  bg=BG, fg=MUTED, font=(FONT, 10)).pack(anchor="w", pady=(2, 8))
 
         perm = tk.Frame(wrap, bg=BG)
@@ -655,6 +733,27 @@ class App(tk.Tk):
             pass
         try:
             self.destroy()
+        except Exception:
+            pass
+
+    def _ensure_guard_once(self):
+        """打开本工具时，若限充处于启用状态但守护没在跑，自动补上。
+
+        守护可能因为开机自启被拦、被安全软件结束、或父进程被清理而消失；
+        限充本身靠钉扎维持，但重启后需要守护重放，所以这里做一次自愈。
+        注意：只在 setting.json 里 enabled=True 时才补 —— 「取消限充」会写
+        enabled=False，此时不会强行拉起，尊重用户的关闭意图。
+        """
+        try:
+            if not bool(read_setting().get("enabled")):
+                return
+            alive, _, _ = guard_status()
+            if alive:
+                return
+            ok, _ = start_guard()
+            if ok:
+                self._flash = ("已自动启动限充守护（后台运行）", OK)
+                self.after(1200, self.refresh)
         except Exception:
             pass
 

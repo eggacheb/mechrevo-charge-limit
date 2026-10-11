@@ -159,6 +159,12 @@ GUI 顶部会实时显示守护运行状态，并有一键启停按钮。
 | [`tools/battery_monitor.py`](tools/battery_monitor.py) | 充电行为监视器：每 5 秒记录电量 / 交流电 / 充电状态 / 实时上限 / 门控位 / 电池电流，落盘 `battery_log.csv`。**只读** |
 | [`tools/state_snapshot.py`](tools/state_snapshot.py) | 一次性打印 EC 关键寄存器 + 电池状态，用于改前改后对照。**只读、免管理员** |
 | [`tools/read-ec-wmi.cmd`](tools/read-ec-wmi.cmd) | 经固件邮箱读各寄存器（含盲区 `0x087F`）。双击自动请求提权；**只读，不写任何寄存器** |
+| [`tools/clear_stored_limit.py`](tools/clear_stored_limit.py) | 诊断用：尝试清空固件存储值 `0x087F` 并验证它能否与限充共存。**需管理员**；只写 `0x07B9`/`0x07C3`，结尾自动恢复限充。见 [`docs/FINDINGS_GM6XG0Q.md`](docs/FINDINGS_GM6XG0Q.md) 第 10 节 |
+
+> **存储值 `0x087F` 要不要手动清？** 在蛟龙16QS 上**不用**，也**清不掉**：
+> 固件在门控打开时会**持续把实时上限同步进去**（实测 2 秒内），
+> 所以只要限充工作，它就是当前上限的镜像 —— 详见
+> [`docs/FINDINGS_GM6XG0Q.md`](docs/FINDINGS_GM6XG0Q.md) 第 10 节。
 
 ## 两条访问通道（决定你要装什么）
 

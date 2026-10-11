@@ -1,0 +1,7 @@
+# 图形界面（电池充电上限.pyw）
+pystray>=0.19
+Pillow>=10
+
+# 仅 install_desktop_shortcut.py 需要（创建带图标的桌面快捷方式）
+# 其余组件（pin_guard.py / install_autostart.py / tools/*）只用标准库
+pywin32>=306

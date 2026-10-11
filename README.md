@@ -24,6 +24,8 @@
 > 4. **GUI 整合管理员深度验证与守护启停**：管理员模式下每次写入后自动经固件邮箱直读
 >    存储区 `0x087F` 复核；界面顶部显示守护运行状态，并可一键启停。
 > 5. **新增配套工具**（见 [`tools/`](tools/)）：充电行为监视器、EC 状态快照、WMI 邮箱读取脚本。
+> 6. **界面改为托盘常驻**：关窗 = 缩到右下角托盘（不退出），托盘菜单可显隐窗口 / 退出；
+>    附应用图标（`battery_limit.ico`）与一键创建桌面快捷方式的脚本。
 
 ![界面截图](assets/screenshot.png)
 
@@ -104,7 +106,24 @@ pythonw 电池充电上限.pyw
 **写入本身不需要管理员** —— 管理员只在直读存储区时才需要。
 非管理员启动时，界面会显示「以管理员身份重启」按钮。
 
-**依赖**：Python 3（标准库即可，需要 tkinter）+ 一条能访问 EC 的通道（见下节）。
+### 缩到系统托盘
+
+点窗口右上角「×」**不会退出**，而是缩到右下角托盘变成常驻小图标。
+点托盘图标 → 「显示 / 隐藏窗口」；菜单里的「退出」才是真的退出。
+（未安装 `pystray` 时会退化成"关窗即退出"，不会崩。）
+
+### 桌面快捷方式（带图标）
+
+```powershell
+py install_desktop_shortcut.py            # 创建
+py install_desktop_shortcut.py --remove   # 删除
+```
+
+图标由 `tools/make_icon.py` 生成（`battery_limit.ico`），需要 `Pillow`；
+创建快捷方式这一步需要 `pywin32`。**两者都只在这一步用得上**，界面和守护本身不需要。
+
+**依赖**：Python 3 + tkinter（标准库）+ `pystray` / `Pillow`（托盘）+
+一条能访问 EC 的通道（见下节）。完整清单见 [`requirements.txt`](requirements.txt)。
 
 ### ⚠️ 蛟龙16QS：必须装开机自启
 
@@ -128,6 +147,8 @@ GUI 顶部会实时显示守护运行状态，并有一键启停按钮。
 |---|---|
 | [`pin_guard.py`](pin_guard.py) | 限充守护：每 30 秒读 `setting.json`，发现钉扎丢了就补上；取消限充时负责释放门控 |
 | [`install_autostart.py`](install_autostart.py) | 安装 / 卸载开机自启（启动文件夹静默 VBS 启动器） |
+| [`install_desktop_shortcut.py`](install_desktop_shortcut.py) | 安装 / 卸载带图标的桌面快捷方式（需 pywin32） |
+| [`tools/make_icon.py`](tools/make_icon.py) | 生成应用图标 `battery_limit.ico`（需 Pillow） |
 | [`tools/battery_monitor.py`](tools/battery_monitor.py) | 充电行为监视器：每 5 秒记录电量 / 交流电 / 充电状态 / 实时上限 / 门控位 / 电池电流，落盘 `battery_log.csv`。**只读** |
 | [`tools/state_snapshot.py`](tools/state_snapshot.py) | 一次性打印 EC 关键寄存器 + 电池状态，用于改前改后对照。**只读、免管理员** |
 | [`tools/read-ec-wmi.cmd`](tools/read-ec-wmi.cmd) | 经固件邮箱读各寄存器（含盲区 `0x087F`）。双击自动请求提权；**只读，不写任何寄存器** |

@@ -24,6 +24,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 
@@ -200,6 +201,57 @@ def stop_guard():
         return True, None
     except Exception as exc:
         return False, str(exc)
+
+
+# ---------- 系统托盘 ----------
+HERE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_ICON = os.path.join(HERE_DIR, "battery_limit.ico")
+
+
+def load_tray_image():
+    """返回托盘图标（PIL Image）；缺库返回 None，缺图标时现场画一个。"""
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+    if os.path.exists(APP_ICON):
+        try:
+            return Image.open(APP_ICON)
+        except Exception:
+            pass
+    img = Image.new("RGBA", (64, 64), (37, 99, 235, 255))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([20, 8, 44, 56], radius=6, outline=(255, 255, 255, 255), width=4)
+    d.rounded_rectangle([26, 24, 38, 50], radius=3, fill=(52, 199, 123, 255))
+    return img
+
+
+def make_tray(app):
+    """创建托盘图标对象；pystray 不可用时返回 None（此时关窗即退出）。"""
+    try:
+        import pystray
+        image = load_tray_image()
+        if image is None:
+            return None
+
+        def _toggle(icon, item):
+            if getattr(app, "_hidden", False):
+                app.after(0, app.show_window)
+            else:
+                app.after(0, app.hide_window)
+
+        def _quit(icon, item):
+            icon.stop()
+            app.after(0, app.quit_app)
+
+        menu = pystray.Menu(
+            pystray.MenuItem("显示 / 隐藏窗口", _toggle, default=True),
+            pystray.MenuItem("退出", _quit),
+        )
+        return pystray.Icon("mechrevo-charge-limit", image, "电池充电上限", menu)
+    except Exception:
+        # 托盘建不起来时退回“关窗即退出”，不能因此让程序崩掉
+        return None
 
 
 def apply_limit(limit):
@@ -398,10 +450,18 @@ class App(tk.Tk):
         x = (self.winfo_screenwidth() - w) // 2
         y = (self.winfo_screenheight() - h) // 3
         self.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        try:
+            self.iconbitmap(APP_ICON)
+        except Exception:
+            pass
         self._busy = False
         self._flash = ("", FG)
+        self._hidden = False
+        self._tray = None
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build()
         self.after(150, self.refresh)
+        self.after(400, self._start_tray)
 
     def _build(self):
         wrap = tk.Frame(self, bg=BG, padx=28, pady=16)
@@ -560,6 +620,43 @@ class App(tk.Tk):
         finally:
             self._busy = False
             self.refresh()
+
+    def _start_tray(self):
+        """托盘要跑在后台线程，否则会阻塞 Tk 主循环。"""
+        self._tray = make_tray(self)
+        if self._tray is not None:
+            threading.Thread(target=self._tray.run, daemon=True).start()
+
+    def hide_window(self):
+        self._hidden = True
+        self.withdraw()
+
+    def show_window(self):
+        self._hidden = False
+        self.deiconify()
+        self.lift()
+        try:
+            self.focus_force()
+        except Exception:
+            pass
+
+    def on_close(self):
+        """关闭窗口 = 缩到托盘；没有托盘时才真的退出。"""
+        if self._tray is not None:
+            self.hide_window()
+        else:
+            self.quit_app()
+
+    def quit_app(self):
+        try:
+            if self._tray is not None:
+                self._tray.stop()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     def on_guard_toggle(self):
         if self._busy:

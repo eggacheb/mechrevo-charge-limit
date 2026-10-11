@@ -6,6 +6,10 @@ uniwill-ec-charge-limit/
 __pycache__/
 *.pyc
 
+# 运行产物
+tools/battery_log.csv
+tools/wmi_result.txt
+
 # 系统
 Thumbs.db
 desktop.ini

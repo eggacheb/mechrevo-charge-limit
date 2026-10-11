@@ -5,7 +5,21 @@
 
 适用机型：**采用 Uniwill（同方 / TongFang）EC 固件的笔记本** —— 机械革命（Mechrevo）、XMG、TUXEDO、Eluktronics，以及神舟 / 火影等部分同方模具机型。
 
-实测机型：**机械革命 无界15X（WUJIE15XA，Ryzen 7 8745HS，BIOS N.1.14MRO50）**
+实测机型：
+
+- **机械革命 无界15X（WUJIE15XA，Ryzen 7 8745HS，BIOS N.1.14MRO50）** —— 上游原作者的实测
+- **机械革命 蛟龙16QS（GM6XG0Q，BIOS N.1.24MRO14）** —— 本 fork 实测，见 [`docs/FINDINGS_GM6XG0Q.md`](docs/FINDINGS_GM6XG0Q.md)
+
+> ### 本 fork 相比上游的改动
+>
+> 1. **适配蛟龙16QS (GM6XG0Q)**：该机型上 `0x0742` bit2 **不反映"存储维持"路径** ——
+>    存储写入成功、且跨重启确认持久之后，bit2 依然是 0。用上游的判据会得出**假阴性**结论。
+>    详见 [`docs/FINDINGS_GM6XG0Q.md`](docs/FINDINGS_GM6XG0Q.md) 第 1 节。
+> 2. **修复取消限充路径的两个缺陷**：原实现未校验 `0x07C3 = 0x04` 是否真的写进去
+>    （可能报成功而存储未更新），且写回原值时抛异常会让平台值卡在 4（门控常开）。
+> 3. **GUI 整合管理员深度验证**：管理员模式下每次写入后自动经固件邮箱直读存储区 `0x087F`，
+>    直接给出 `存储区复核：80% ✔` 这类确定结论，不再依赖间接判据。
+> 4. **新增配套工具**（见 [`tools/`](tools/)）：充电行为监视器、EC 状态快照、WMI 邮箱读取脚本。
 
 ![界面截图](assets/screenshot.png)
 
@@ -64,17 +78,37 @@ store_limit();      // 实时上限 → 存储区
 
 ## 使用
 
+双击 `电池充电上限.pyw` 即可（`.pyw` 关联到 `pyw.exe`，不弹控制台窗口）。命令行等价写法：
+
 ```powershell
 pythonw 电池充电上限.pyw
 ```
 
 界面提供：
 
-- 状态四格：当前电量 / 充电状态 / 设定上限 / 限充门控
+- 状态四格：当前电量 / 充电状态 / 设定上限 / 限充状态
 - 档位按钮：50 / 60 / 70 / 80 / 90 / 100 %
-- 「取消限充（恢复充满）」：一键清除实时上限与固件存储值，电池恢复充电（实测 12 秒内 `ChargeRate=34034 mW`）
+- 「取消限充（恢复充满）」：一键清除实时上限与固件存储值，电池恢复充电（上游实测 12 秒内 `ChargeRate=34034 mW`）
+
+### 普通权限 vs 管理员
+
+| 模式 | 启动方式 | 写入 | 验证 |
+|---|---|---|---|
+| 普通 | 双击 | ✅ 免提权（H2RAM 通道） | 回读寄存器校验 |
+| 管理员 | 右键 →「以管理员身份运行」 | ✅ | ✅ **经固件邮箱直读存储区 `0x087F`**，给出确定结论 |
+
+**写入本身不需要管理员** —— 管理员只在直读存储区时才需要。
+非管理员启动时，界面会显示「以管理员身份重启」按钮。
 
 **依赖**：Python 3（标准库即可，需要 tkinter）+ 一条能访问 EC 的通道（见下节）。
+
+### 配套工具
+
+| 工具 | 用途 |
+|---|---|
+| [`tools/battery_monitor.py`](tools/battery_monitor.py) | 充电行为监视器：每 5 秒记录电量 / 交流电 / 充电状态 / 实时上限 / 门控位 / 电池电流，落盘 `battery_log.csv`。**只读** |
+| [`tools/state_snapshot.py`](tools/state_snapshot.py) | 一次性打印 EC 关键寄存器 + 电池状态，用于改前改后对照。**只读、免管理员** |
+| [`tools/read-ec-wmi.cmd`](tools/read-ec-wmi.cmd) | 经固件邮箱读各寄存器（含盲区 `0x087F`）。双击自动请求提权；**只读，不写任何寄存器** |
 
 ## 两条访问通道（决定你要装什么）
 
@@ -116,22 +150,47 @@ pythonw 电池充电上限.pyw
 1. **先读并存档原值**：`0x0770`、`0x07C3`、`0x07B9`（回滚要用）
 2. 写 `0x07B9 = 目标百分比`（50 → `0x32`）
 3. 写 `0x07C3 = 0x04`，保持 2.5 秒，**然后恢复原值**（本机为 `0x07`）
-4. 等 7 秒，读 `0x0742` bit2 = 1 → 门控已开
+4. 验证门控已开
 5. 验证：把电量放到上限以下 → 插电 → 应精确停在目标值（`Charging=False`、`ChargeRate=0`）
 6. **取消时必须写 `0x07B9 = 0` 并再触发一次存储** —— 只关门控、不清上限，会让电池卡住不充电
+
+> ⚠️ **第 3 步必须回读确认 `0x07C3` 真的写成了 `0x04`。**
+> 只校验"最后恢复成功"是不够的：若写入没生效，门控其实没开、固件不会执行
+> `store_limit()`，而函数会误判成功。取消限充时就会留下 **`live` 清成 0 而 `stored` 仍是旧值** 的错配。
+> 同时要保证异常路径下平台值不会卡在 4 —— 本 fork 的 `电池充电上限.pyw` 已加上这两道防线。
+
+> ⚠️ **第 4 步的判据并非所有机型适用。**
+> 上游用 `0x0742` bit2 = 1 判定门控已开，但**蛟龙16QS 上该位不反映"存储维持"路径**：
+> 存储写入成功、且经重启确认持久之后，bit2 依然是 0（见 [`docs/FINDINGS_GM6XG0Q.md`](docs/FINDINGS_GM6XG0Q.md) 第 1 节）。
+> 更可靠的判据是**经 WMI 邮箱直读 `0x087F`**，或直接做第 5 步的充电行为验证。
 
 完整寄存器语义、门控伪代码、踩坑清单见 [`docs/FINDINGS.md`](docs/FINDINGS.md)。
 
 ### 2. 文件直链（中文文件名必须 URL 编码）
 
 ```
-README.md     https://raw.githubusercontent.com/Leo-stro/mechrevo-charge-limit/main/README.md
-逆向记录       https://raw.githubusercontent.com/Leo-stro/mechrevo-charge-limit/main/docs/FINDINGS.md
-主程序         https://raw.githubusercontent.com/Leo-stro/mechrevo-charge-limit/main/%E7%94%B5%E6%B1%A0%E5%85%85%E7%94%B5%E4%B8%8A%E9%99%90.pyw
-整仓 ZIP       https://github.com/Leo-stro/mechrevo-charge-limit/archive/refs/heads/main.zip
+README.md        https://raw.githubusercontent.com/eggacheb/mechrevo-charge-limit/main/README.md
+逆向记录（无界15X） https://raw.githubusercontent.com/eggacheb/mechrevo-charge-limit/main/docs/FINDINGS.md
+逆向记录（蛟龙16QS） https://raw.githubusercontent.com/eggacheb/mechrevo-charge-limit/main/docs/FINDINGS_GM6XG0Q.md
+主程序           https://raw.githubusercontent.com/eggacheb/mechrevo-charge-limit/main/%E7%94%B5%E6%B1%A0%E5%85%85%E7%94%B5%E4%B8%8A%E9%99%90.pyw
+整仓 ZIP         https://github.com/eggacheb/mechrevo-charge-limit/archive/refs/heads/main.zip
 ```
 
 （未编码的中文路径会直接报错 —— 这是最容易踩的一脚。）
+
+### 3. 读存储区的三个坑（否则会读成 0）
+
+实现 WMI 邮箱读取时，这三条任意一条踩中都会让所有寄存器读回 0，
+看起来像"邮箱不响应"，实则不然：
+
+1. 返回值的属性名是 **`Return`**，不是 `ReturnValue`；
+2. `AcpiTest_MULong` 有 **10 个实例**，`Get-WmiObject` 返回的是数组，
+   直接对数组调方法会触发成员枚举、结果变成 `Object[]` —— 必须 `@(...)[0]` 只取一个；
+3. PS 5.1 下 `([uint64]0x0100) -shl 32` 会得到 `Object[]`，改用
+   `[uint64]256 * [uint64]4294967296`；另外中文 Windows 上 PowerShell 输出是 GBK，
+   Python 侧用 `text=True` 会 `UnicodeDecodeError`。
+
+完整说明见 [`docs/FINDINGS_GM6XG0Q.md`](docs/FINDINGS_GM6XG0Q.md) 第 3 节。
 
 ## 取消 / 还原
 
@@ -150,13 +209,13 @@ README.md     https://raw.githubusercontent.com/Leo-stro/mechrevo-charge-limit/m
 | | 说明 |
 |---|---|
 | ✅ 适用 | 采用 Uniwill/同方 EC 的机型（机械革命、XMG、TUXEDO、Eluktronics、部分神舟/火影） |
-| ⚠️ 需先探测 | 同产品线不同型号的寄存器语义可能微调，**应先只读探测再写入**（见 `docs/FINDINGS.md`） |
+| ⚠️ 需先探测 | 同产品线不同型号的寄存器语义可能微调，**应先只读探测再写入**。已知差异：蛟龙16QS 上 `0x0742` bit2 不能用作成效判据（见 `docs/FINDINGS_GM6XG0Q.md`） |
 | ❌ 不适用 | 联想 / 戴尔 / 惠普 / 华硕 / 宏碁 / 苹果等 —— EC 固件完全不同，寄存器地址表对不上。这类机型请用原厂工具（Lenovo Vantage、Dell Power Manager、MyASUS 等） |
 
 ## 风险与免责
 
 - 本方案写入的是**未公开的 EC 寄存器**，属于社区逆向成果，非官方支持的功能。
-- Linux 内核文档对同类操作有明确警告：*某些设备未正确实现充电阈值接口，强行启用**可能损坏电池***。本项目已在 WUJIE15XA 上实测正常（精确停充、可逆、温度风扇无异常），但**长期风险无法保证**。
+- Linux 内核文档对同类操作有明确警告：*某些设备未正确实现充电阈值接口，强行启用**可能损坏电池***。本项目已在 WUJIE15XA 与 蛟龙16QS (GM6XG0Q) 上实测正常（精确停充、可逆、温度风扇无异常），但**长期风险无法保证**。
 - 写入的都是易失 RAM（存储区除外），**不刷固件、不碰闪存**。
 - 作者不对任何硬件损坏、数据丢失负责，操作自负风险。
 

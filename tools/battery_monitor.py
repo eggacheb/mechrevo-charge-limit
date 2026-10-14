@@ -90,6 +90,10 @@ def main():
     print("Battery charge-limit monitor - READ ONLY")
     print("Log file:", LOG_PATH)
     print("Press Ctrl+C to stop.\n")
+    print("  pct=battery %        AC=charger plugged in (Windows ACLineStatus)")
+    print("  charging=Windows says charging now")
+    print("  limit=EC 0x07B9 live limit    gate=0x0742 bit2 (1=control loop active)")
+    print("  ec_current=battery current in EC units (0 = no current)\n")
     print("  time      pct  AC     charging  limit  gate  ec_current  note")
     print("  " + "-" * 72)
 
@@ -116,12 +120,14 @@ def main():
                 rem = rem_lo | (rem_hi << 8)
 
             note = ""
-            if s:
-                if s["ac"] and not s["charging"] and lim_pct > 0 and s["pct"] is not None:
+            if s and s["pct"] is not None:
+                if s["ac"] and not s["charging"] and lim_pct > 0:
                     if s["pct"] > lim_pct:
-                        note = "AC on, NOT charging, above limit -> limit likely ACTIVE"
+                        note = "AC on, NOT charging, ABOVE limit -> limit ACTIVE"
+                    elif s["pct"] == lim_pct:
+                        note = "AC on, NOT charging, AT limit -> limit ACTIVE"
                     else:
-                        note = "AC on, NOT charging, below limit"
+                        note = "AC on, NOT charging, below limit (not limited yet)"
                 if prev_pct is not None and s["ac"] and s["charging"]:
                     note = "charging up..."
 

@@ -170,7 +170,7 @@ py install_autostart.py --remove   # 卸载
 
 | 工具 | 用途 |
 |---|---|
-| [`pin_guard.py`](pin_guard.py) | 限充守护：每 30 秒读 `setting.json`，发现钉扎丢了就补上；取消限充时负责释放门控 |
+| [`pin_guard.py`](pin_guard.py) | 限充守护：常规每 30 秒读 `setting.json`，发现钉扎丢了就补上；**启动后前 5 分钟改为每 5 秒一次**（抢开机后那段"门控还没钉上"的空窗）；取消限充时负责释放门控 |
 | [`install_boot_task.py`](install_boot_task.py) | 安装 / 卸载**开机启动**计划任务（启动时触发、SYSTEM、最高权限）。**推荐** |
 | [`install_autostart.py`](install_autostart.py) | 备选：安装 / 卸载启动文件夹里的静默 VBS 启动器 |
 | [`install_desktop_shortcut.py`](install_desktop_shortcut.py) | 安装 / 卸载带图标的桌面快捷方式（需 pywin32） |

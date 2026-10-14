@@ -795,9 +795,18 @@ class App(tk.Tk):
         alive, age, hb = guard_status()
         self.guard_btn.config(text="停止守护" if alive else "启动守护")
         if alive:
+            iv_txt = ""
+            try:
+                iv = float(hb.get("interval"))
+                iv_txt = " · 自检 %gs" % iv
+                if iv < 30:
+                    iv_txt += "（启动加速中）"
+            except (TypeError, ValueError):
+                pass
             self.guard_lbl.config(
-                text="限充守护：运行中 · 目标 %s%% · 心跳 %s（重启后自动重放）"
-                     % (hb.get("limit", "?"), hb.get("time_str", "?")), fg=OK)
+                text="限充守护：运行中 · 目标 %s%% · 心跳 %s%s"
+                     % (hb.get("limit", "?"), hb.get("time_str", "?"), iv_txt),
+                fg=OK)
         else:
             age_txt = "" if age is None else "（心跳 %.0f 秒前）" % age
             self.guard_lbl.config(

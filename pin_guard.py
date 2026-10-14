@@ -62,6 +62,13 @@ LOG_PATH = os.path.join(CFG_DIR, "guard.log")
 
 INTERVAL = float(os.environ.get("PIN_GUARD_INTERVAL", "30"))
 
+# 启动初期加速：开机后到"门控被钉上"之间存在一段空窗 —— 此时门控是关的，
+# 插着电的话电池会一路往上充。前 FAST_WINDOW 秒改用 FAST_INTERVAL 秒的高频
+# 自检去抢时间（驱动可能还没就绪，多试几次就能早一点钉上），之后回到 INTERVAL。
+# 此举几乎不占 CPU：一次自检只是几次 DeviceIoControl 读。
+FAST_INTERVAL = float(os.environ.get("PIN_GUARD_FAST_INTERVAL", "5"))
+FAST_WINDOW = float(os.environ.get("PIN_GUARD_FAST_WINDOW", "300"))
+
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.CreateFileW.restype = ctypes.c_void_p
 kernel32.DeviceIoControl.restype = ctypes.c_bool
@@ -128,7 +135,7 @@ def write_heartbeat(payload):
         pass
 
 
-def _tick(last_state, last_err):
+def _tick(last_state, last_err, cur_interval):
     """执行一轮自检。返回 (新的 last_state, 新的 last_err)。"""
     # 读不到配置时**绝不动寄存器**：以 SYSTEM 身份开机启动、或配置目录定位失败
     # 时，如果把它当成"enabled=False"就会去释放门控，反而把限充关掉。
@@ -195,26 +202,39 @@ def _tick(last_state, last_err):
         "enabled": enabled,
         "limit": limit,
         "action": action,
-        "interval": INTERVAL,
+        "interval": cur_interval,
     })
     return last_state, last_err
 
 
 def main():
-    log("guard started (interval=%ss, pid=%s)" % (INTERVAL, os.getpid()))
+    log("guard started (interval=%ss, fast=%ss for first %ss, pid=%s)"
+        % (INTERVAL, FAST_INTERVAL, FAST_WINDOW, os.getpid()))
+    started = time.monotonic()
     last_state = None
     last_err = None
+    fast_mode = True
 
     while True:
+        in_fast = (time.monotonic() - started) < FAST_WINDOW
+        if in_fast != fast_mode:
+            fast_mode = in_fast
+            log("自检间隔 -> %ss（启动加速%s）"
+                % (FAST_INTERVAL if in_fast else INTERVAL,
+                   "开始" if in_fast else "结束"))
+
         # 整个循环体都包在 try 里：任何意外（驱动报错、编码问题、
         # 文件被占用…）都不允许把守护悄悄带走。它必须一直活着。
         try:
-            last_state, last_err = _tick(last_state, last_err)
+            last_state, last_err = _tick(
+                last_state, last_err,
+                FAST_INTERVAL if in_fast else INTERVAL)
         except BaseException as exc:
             if repr(exc) != last_err:
                 log("loop error: %r" % (exc,))
                 last_err = repr(exc)
-        time.sleep(INTERVAL)
+
+        time.sleep(FAST_INTERVAL if in_fast else INTERVAL)
 
 
 if __name__ == "__main__":

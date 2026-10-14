@@ -127,8 +127,21 @@ def platform_original(h):
 
 
 # ---------- 配置：供开机守护 (pin_guard.py) 读取 ----------
-CFG_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "MechrevoChargeLimit")
+# 取法与 pin_guard.py 的 _resolve_cfg_dir() 保持一致（两边必须同步改）：
+# 优先本脚本所在目录 —— 守护可能由系统级计划任务以 SYSTEM 身份在开机时启动，
+# 那时没有用户环境变量；本机安装目录恰好就是 %LOCALAPPDATA%\MechrevoChargeLimit。
+def _resolve_cfg_dir():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_dir = os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+        "MechrevoChargeLimit")
+    for cand in (script_dir, env_dir):
+        if os.path.exists(os.path.join(cand, "setting.json")):
+            return cand
+    return env_dir
+
+
+CFG_DIR = _resolve_cfg_dir()
 CFG_PATH = os.path.join(CFG_DIR, "setting.json")
 HEARTBEAT_PATH = os.path.join(CFG_DIR, "guard_heartbeat.json")
 
@@ -270,7 +283,11 @@ def stop_guard():
             if r.returncode != 0:
                 # 进程恰好在此期间退出也会返回非零，只要已不在就算成功
                 if _pid_alive(pid) is not False:
-                    return False, "taskkill 返回 %d" % r.returncode
+                    return False, ("无法结束该守护进程 —— 它可能由系统级计划任务"
+                                   "以 SYSTEM 身份开机启动，需要管理员权限才能终止。"
+                                   "可右键以管理员身份运行本工具，或在「任务计划程序」"
+                                   "里禁用 MechrevoChargeLimitGuard；"
+                                   "只想停止限充的话，点「取消限充」即可。")
         except Exception as exc:
             return False, str(exc)
     try:

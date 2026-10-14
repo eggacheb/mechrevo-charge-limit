@@ -134,26 +134,45 @@ py install_desktop_shortcut.py --remove   # 删除
 
 ### ⚠️ 蛟龙16QS：必须装开机自启
 
-该机型限充靠**门控钉扎**实现，而钉扎值**重启即丢**。所以必须让守护开机重放：
+该机型限充靠**门控钉扎**实现，而钉扎值**重启即丢**。所以必须让守护开机重放。
+
+**推荐做法：系统级计划任务（开机触发，登录前就跑）**
 
 ```powershell
-py install_autostart.py            # 安装（守护 + 启动项）
-py install_autostart.py --status   # 查看状态
+py install_boot_task.py            # 安装（会请求一次提权）
+py install_boot_task.py --status   # 查看状态
+py install_boot_task.py --remove   # 卸载
+```
+
+它建的任务是 `MechrevoChargeLimitGuard`：触发器「启动时」+ 运行身份 `SYSTEM` + 最高权限，
+电池供电时也启动，异常退出自动重试 3 次。
+
+**为什么不用启动文件夹：** 那里的项是**用户登录之后**才由资源管理器拉起的，
+顺序不可控，也没有任何优先级设置；计划任务的「启动时」在**登录之前**就执行 ——
+这才是真正的"最早启动"。而且守护是无界面程序，不需要用户会话。
+
+> 代价：守护由 SYSTEM 运行，**普通权限的界面无法结束它**。要停就在
+> 「任务计划程序」里禁用该任务，或用界面上的「取消限充」释放门控。
+
+**备选：启动文件夹静默 VBS**（更简单，但启动晚一截）
+
+```powershell
+py install_autostart.py            # 安装
 py install_autostart.py --remove   # 卸载
 ```
 
-不装的话，**每次重启后限充都会失效**（电池会一路充到 100%）。
-GUI 顶部会实时显示守护运行状态，并有一键启停按钮。
+> ⚠️ 往启动文件夹放东西会触发**火绒等国产安全软件**的启动项弹窗，必须放行。
 
-> ⚠️ 往启动文件夹放东西会触发**火绒等国产安全软件**的启动项弹窗，必须放行，
-> 否则开机后守护起不来。
+无论用哪种，GUI 顶部都会实时显示守护运行状态。不装的话，**每次重启后限充都会失效**
+（电池会一路充到 100%）。
 
 ### 配套工具
 
 | 工具 | 用途 |
 |---|---|
 | [`pin_guard.py`](pin_guard.py) | 限充守护：每 30 秒读 `setting.json`，发现钉扎丢了就补上；取消限充时负责释放门控 |
-| [`install_autostart.py`](install_autostart.py) | 安装 / 卸载开机自启（启动文件夹静默 VBS 启动器） |
+| [`install_boot_task.py`](install_boot_task.py) | 安装 / 卸载**开机启动**计划任务（启动时触发、SYSTEM、最高权限）。**推荐** |
+| [`install_autostart.py`](install_autostart.py) | 备选：安装 / 卸载启动文件夹里的静默 VBS 启动器 |
 | [`install_desktop_shortcut.py`](install_desktop_shortcut.py) | 安装 / 卸载带图标的桌面快捷方式（需 pywin32） |
 | [`tools/make_icon.py`](tools/make_icon.py) | 生成应用图标 `battery_limit.ico`（需 Pillow） |
 | [`tools/battery_monitor.py`](tools/battery_monitor.py) | 充电行为监视器：每 5 秒记录电量 / 交流电 / 充电状态 / 实时上限 / 门控位 / 电池电流，落盘 `battery_log.csv`。**只读** |

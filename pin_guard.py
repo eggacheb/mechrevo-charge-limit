@@ -36,9 +36,26 @@ REG_LIMIT = 0x07B9
 PIN_VALUE = 0x04
 PLATFORM_DEFAULT = 0x07
 
-CFG_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "MechrevoChargeLimit"
-)
+def _resolve_cfg_dir():
+    """定位配置目录。
+
+    优先用**本脚本所在目录**：守护若由系统级计划任务以 SYSTEM 身份在开机时
+    启动（用户尚未登录、没有 LOCALAPPDATA 等用户环境变量），只有这样才找得到
+    与界面同一份 setting.json。本机安装目录恰好就是
+    %LOCALAPPDATA%\\MechrevoChargeLimit，两种取法结果一致。
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_dir = os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+        "MechrevoChargeLimit",
+    )
+    for cand in (script_dir, env_dir):
+        if os.path.exists(os.path.join(cand, "setting.json")):
+            return cand
+    return env_dir
+
+
+CFG_DIR = _resolve_cfg_dir()
 CFG_PATH = os.path.join(CFG_DIR, "setting.json")
 HEARTBEAT_PATH = os.path.join(CFG_DIR, "guard_heartbeat.json")
 LOG_PATH = os.path.join(CFG_DIR, "guard.log")
@@ -113,6 +130,9 @@ def write_heartbeat(payload):
 
 def _tick(last_state, last_err):
     """执行一轮自检。返回 (新的 last_state, 新的 last_err)。"""
+    # 读不到配置时**绝不动寄存器**：以 SYSTEM 身份开机启动、或配置目录定位失败
+    # 时，如果把它当成"enabled=False"就会去释放门控，反而把限充关掉。
+    has_cfg = os.path.exists(CFG_PATH)
     cfg = read_cfg()
     enabled = bool(cfg.get("enabled"))
     try:
@@ -129,9 +149,12 @@ def _tick(last_state, last_err):
         original = PLATFORM_DEFAULT
 
     h = open_driver()
-    action = "no-channel" if h is None else ""
+    if not has_cfg:
+        action = "no-config: registers left untouched"
+    else:
+        action = "no-channel" if h is None else ""
     try:
-        if h is not None:
+        if h is not None and has_cfg:
             if enabled:
                 fixed = []
                 cur_lim = rd(h, REG_LIMIT)

@@ -349,4 +349,89 @@ live=80 + 门控钉扎    stored=80   live=80   platform=0x04    ← 2 秒内就
 要读真值只有固件 WMI 邮箱一条路，而它**必须管理员** —— 这也是为什么
 本项目的"复核存储值"功能只在管理员模式下出现。
 
+---
+
+## 11. 开机自启：为什么用计划任务，以及 SYSTEM 身份的两个坑
+
+限充靠"门控钉扎"，钉扎值重启即丢，所以开机后**越早重放越好**。
+
+### 11.1 「启动」文件夹没有任何优先级可调
+
+启动文件夹（`shell:startup`）里的项是**用户登录之后**由资源管理器依次拉起的，
+顺序不由用户控制（大致按文件名），Windows 也没提供"高优先级启动"的开关。
+放一个 GUI 快捷方式进去，实际效果是：
+
+- 启动**更晚**（GUI 还要加载 tkinter + 托盘，再靠"打开时自愈"才把守护拉起来）
+- 链路**更脆**（GUI 一旦起不来就没有守护）
+
+真正需要开机自启的是**守护**（无界面），不是 GUI。
+
+### 11.2 正确做法：计划任务「启动时」+ SYSTEM
+
+```
+触发器：启动时（At startup）      ← 在用户登录之前执行，这是最早时机
+运行身份：SYSTEM / 最高权限        ← 无界面程序不需要用户会话
+设置：电池供电时也启动、异常退出重试 3 次、不限执行时长、IgnoreNew
+动作：pythonw.exe pin_guard.py
+```
+
+本项目提供 `install_boot_task.py` 一键建这个任务（`--status` / `--remove`）。
+
+### 11.3 坑一：SYSTEM 身份下 `LOCALAPPDATA` 指向 systemprofile
+
+守护原本用 `%LOCALAPPDATA%\MechrevoChargeLimit` 定位配置。以 SYSTEM 运行时：
+
+```
+%LOCALAPPDATA%  ->  C:\Windows\system32\config\systemprofile\AppData\Local
+```
+
+于是它去找 `...\systemprofile\AppData\Local\MechrevoChargeLimit\setting.json` ——
+**那里没有配置文件**。
+
+**修法**：配置目录改为**优先用脚本自身所在目录**（本机安装目录恰好就是
+`%LOCALAPPDATA%\MechrevoChargeLimit`，两种取法结果一致）。`pin_guard.py` 的
+`_resolve_cfg_dir()` 与 `电池充电上限.pyw` 里的同名函数必须保持一致。
+
+### 11.4 坑二：配置读不到时，绝不能当成"取消限充"
+
+这一条比坑一更危险。`pin_guard.py` 原本是：
+
+```python
+enabled = bool(cfg.get("enabled"))   # 读不到配置 -> False
+...
+else:                                # 于是走"释放门控"分支
+    wr(h, REG_PLATFORM, original)
+```
+
+也就是说，一旦配置目录定位失败，守护会**主动把门控释放掉**，直接关掉限充 ——
+与预期完全相反。
+
+**修法**：配置文件不存在时**什么都不做**（`action = "no-config: registers left untouched"`）。
+"取消限充"仍然有效 —— 因为那是界面显式写入 `enabled=false`，文件是存在的。
+
+### 11.5 实测
+
+```
+脚本所在目录  : ...\MechrevoChargeLimit
+解析出的配置目录: ...\MechrevoChargeLimit          ✅ 命中脚本目录
+模拟 SYSTEM 的 LOCALAPPDATA -> ...\systemprofile\...
+  解析结果仍为 ...\MechrevoChargeLimit             ✅ 不受影响
+配置缺失时跑一轮：
+  action  : no-config: registers left untouched
+  改动前 / 改动后 : (4, 198, 255) / (4, 198, 255)   ✅ 寄存器分毫未动
+```
+
+任务本身也验证过：手动触发后进程归属为 `NT AUTHORITY\SYSTEM`，
+心跳每 30 秒稳定刷新，`action=ensure:ok`，寄存器保持钉扎。
+
+### 11.6 代价：SYSTEM 守护无法从普通权限界面结束
+
+`taskkill` 需要更高权限。界面上的「停止守护」会明确提示这一点，并给出两条出路：
+在「任务计划程序」里禁用任务，或用「取消限充」（写 `enabled=false`）让守护自行释放门控。
+
+> 另注：界面的"守护是否在运行"判定**必须同时看 PID**（第 9.1 节）。
+> 这里正好用上当时加的兜底：`OpenProcess` 对更高权限进程会返回
+> `ERROR_ACCESS_DENIED`，此时回退到"只看心跳时间戳"，不会误报"未运行"。
+
+
 
